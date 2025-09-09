@@ -4,13 +4,19 @@ import subprocess
 import shutil
 import sys
 import os
+import threading
+import time
 
 # --- PDF 압축 핵심 기능 ---
-def compress_pdf(input_path, output_path, quality_level):
+def compress_pdf(input_path, output_path, quality_level, progress_callback=None):
     """
     Ghostscript를 사용하여 PDF를 압축합니다.
     - quality_level: 'screen', 'ebook', 'printer', 'prepress' 중 하나
+    - progress_callback: 진행률을 업데이트하는 콜백 함수
     """
+    if progress_callback:
+        progress_callback(10, "Ghostscript 확인 중...")
+    
     gs_command = find_ghostscript_executable()
     if not gs_command:
         messagebox.showerror(
@@ -20,6 +26,9 @@ def compress_pdf(input_path, output_path, quality_level):
             "PATH 환경 변수에 추가해야 합니다."
         )
         return False
+
+    if progress_callback:
+        progress_callback(25, "압축 명령 준비 중...")
 
     # Ghostscript 명령어 구성
     command = [
@@ -35,12 +44,18 @@ def compress_pdf(input_path, output_path, quality_level):
     ]
 
     try:
+        if progress_callback:
+            progress_callback(40, "PDF 압축 시작...")
+
         # 서브프로세스로 Ghostscript 실행
         # Windows에서는 CREATE_NO_WINDOW 플래그로 콘솔 창 숨김
         startupinfo = None
         if sys.platform == "win32":
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        
+        if progress_callback:
+            progress_callback(60, "압축 처리 중...")
         
         process = subprocess.run(
             command, 
@@ -49,6 +64,16 @@ def compress_pdf(input_path, output_path, quality_level):
             stderr=subprocess.PIPE,
             startupinfo=startupinfo
         )
+        
+        if progress_callback:
+            progress_callback(90, "압축 완료 확인 중...")
+        
+        # 짧은 지연으로 사용자가 진행률을 볼 수 있게 함
+        time.sleep(0.5)
+        
+        if progress_callback:
+            progress_callback(100, "압축 완료!")
+            
         return True
     except FileNotFoundError:
         messagebox.showerror("오류", "Ghostscript를 실행할 수 없습니다. 설치를 확인해주세요.")
@@ -80,10 +105,11 @@ class PDFCompressorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("PDF 압축기")
-        self.root.geometry("500x420")
+        self.root.geometry("500x480")
         self.root.resizable(True, True)
 
         self.input_file_path = ""
+        self.compression_thread = None
 
         # 스타일 설정
         self.style = ttk.Style()
@@ -128,9 +154,28 @@ class PDFCompressorApp:
             rb = ttk.Radiobutton(quality_frame, text=text, variable=self.quality_var, value=value)
             rb.pack(anchor="w", pady=2)
 
-        # 4. 압축 실행 버튼
-        compress_button = ttk.Button(main_frame, text="압축 시작", command=self.start_compression)
-        compress_button.pack(pady=20, fill=tk.X, ipady=5)
+        # 4. 진행률 표시 프레임
+        progress_frame = ttk.LabelFrame(main_frame, text="압축 진행률", padding="10 10")
+        progress_frame.pack(fill=tk.X, pady=10)
+        
+        # 진행률 바
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(
+            progress_frame, 
+            variable=self.progress_var, 
+            maximum=100, 
+            length=400,
+            mode='determinate'
+        )
+        self.progress_bar.pack(fill=tk.X, pady=(0, 5))
+        
+        # 진행률 상태 텍스트
+        self.progress_label = ttk.Label(progress_frame, text="대기 중...")
+        self.progress_label.pack()
+
+        # 5. 압축 실행 버튼
+        self.compress_button = ttk.Button(main_frame, text="압축 시작", command=self.start_compression)
+        self.compress_button.pack(pady=20, fill=tk.X, ipady=5)
 
     def browse_file(self):
         file_path = filedialog.askopenfilename(
@@ -144,6 +189,46 @@ class PDFCompressorApp:
             if len(display_name) > 35:
                 display_name = "..." + display_name[-32:]
             self.file_label.config(text=f" {display_name}")
+
+    def update_progress(self, value, status_text):
+        """진행률 바와 상태 텍스트를 업데이트합니다."""
+        self.progress_var.set(value)
+        self.progress_label.config(text=status_text)
+        self.root.update_idletasks()
+
+    def compression_worker(self, input_path, output_path, quality):
+        """별도 스레드에서 실행되는 압축 작업"""
+        def progress_callback(value, text):
+            # GUI 업데이트는 메인 스레드에서 실행
+            self.root.after(0, lambda: self.update_progress(value, text))
+        
+        success = compress_pdf(input_path, output_path, quality, progress_callback)
+        
+        # 압축 완료 후 결과 처리
+        self.root.after(0, lambda: self.compression_finished(success, input_path, output_path))
+
+    def compression_finished(self, success, input_path, output_path):
+        """압축 완료 후 처리"""
+        self.compress_button.config(state="normal", text="압축 시작")
+        self.root.config(cursor="")
+        
+        if success:
+            original_size = os.path.getsize(input_path) / (1024 * 1024) # MB
+            compressed_size = os.path.getsize(output_path) / (1024 * 1024) # MB
+            reduction = ((original_size - compressed_size) / original_size) * 100
+            
+            info_message = (
+                f"압축이 완료되었습니다!\n\n"
+                f"원본 크기: {original_size:.2f} MB\n"
+                f"압축 후 크기: {compressed_size:.2f} MB\n"
+                f"파일 크기 감소율: {reduction:.1f}%"
+            )
+            messagebox.showinfo("완료", info_message)
+            
+            # 진행률 초기화
+            self.update_progress(0, "압축 완료! 새로운 파일을 선택하세요.")
+        else:
+            self.update_progress(0, "압축 실패. 다시 시도해주세요.")
 
     def start_compression(self):
         if not self.input_file_path:
@@ -162,26 +247,18 @@ class PDFCompressorApp:
 
         quality = self.quality_var.get()
         
-        # 압축 실행
-        self.root.config(cursor="wait") # 마우스 커서를 대기 모양으로 변경
-        self.root.update()
+        # UI 상태 변경
+        self.compress_button.config(state="disabled", text="압축 중...")
+        self.root.config(cursor="wait")
+        self.update_progress(0, "압축 준비 중...")
 
-        success = compress_pdf(self.input_file_path, output_path, quality)
-        
-        self.root.config(cursor="") # 마우스 커서 원래대로
-        
-        if success:
-            original_size = os.path.getsize(self.input_file_path) / (1024 * 1024) # MB
-            compressed_size = os.path.getsize(output_path) / (1024 * 1024) # MB
-            reduction = ((original_size - compressed_size) / original_size) * 100
-            
-            info_message = (
-                f"압축이 완료되었습니다!\n\n"
-                f"원본 크기: {original_size:.2f} MB\n"
-                f"압축 후 크기: {compressed_size:.2f} MB\n"
-                f"파일 크기 감소율: {reduction:.1f}%"
-            )
-            messagebox.showinfo("완료", info_message)
+        # 별도 스레드에서 압축 실행
+        self.compression_thread = threading.Thread(
+            target=self.compression_worker,
+            args=(self.input_file_path, output_path, quality)
+        )
+        self.compression_thread.daemon = True
+        self.compression_thread.start()
 
 
 if __name__ == "__main__":
